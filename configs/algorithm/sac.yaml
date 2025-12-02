@@ -1,0 +1,25 @@
+# normalization
+norm_obs: true
+norm_reward: false
+
+# for network parameters
+activation: Mish
+hidden_dim: 256
+
+# for training
+train_frequency: 5
+train_epochs: 1
+discount_factor: 0.99
+lr: 3.0e-4
+alpha_lr: 3.0e-3
+buffer_size: 3_000_000
+init_update_steps: 5000
+batch_size: 256
+init_entropy_alpha: 0.1
+polyak_tau: 0.995
+max_grad_norm: 1.0
+
+# logger
+log_list:
+  rollout: [score, step, ep_len]
+  train: [actor_loss, critic_loss, entropy_loss, alpha, entropy, epochs, lr, average_q]

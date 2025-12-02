@@ -1,0 +1,14 @@
+# result
+results*
+imgs
+
+# file
+*.mp4
+*.gif
+*.pkl
+
+# etc
+wandb
+__pyc*
+__pycache__
+.vscode
