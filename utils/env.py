@@ -78,6 +78,7 @@ class F1Wrapper(gym.Wrapper):
         self.prev_steer = 0.0  # For steering smoothness reward
         self.scan_buffer = np.zeros(1080) # Buffer for lidar processing
 
+
     def _reset_pose(self, obs_dict):
         # collision
         self.collision = obs_dict['collisions'][0]
@@ -234,7 +235,7 @@ class F1Wrapper(gym.Wrapper):
         
         # Combined Reward
         # Weighted sum favoring speed on track
-        reward = (progress_reward * 1.0 +           # Main driver
+        reward = (progress_reward * 2.0 +           # Main driver
                   centerline_reward * 0.5 +         # Keep on track
                   heading_reward * 0.5 -            # Face forward
                   collision_cost -                  # Don't crash
@@ -293,6 +294,10 @@ class F1Wrapper(gym.Wrapper):
         # ---------------------------------------------------------------------
         try:
             obs_dict, _, terminate, truncate, info = self._env.step(_action)
+            
+            # Update steer buffer
+            self.steer_buffer.append(action[0])
+            
             self._step_pose(obs_dict)
             obs = self.getObs(obs_dict)
             reward, reward_dict = self.calc_reward()
