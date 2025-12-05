@@ -42,6 +42,10 @@ class Agent(AgentBase):
         self.actor = SquashedActor(args).to(self.device)
         self.critic = DoubleQCritic(args).to(self.device)
         self.target_critic = DoubleQCritic(args).to(self.device)
+        self.actor.initialize()
+        self.critic.initialize()
+        self.target_critic.initialize()
+
         self.log_entropy_alpha = torch.log(self.init_entropy_alpha*torch.ones(1, dtype=torch.float32, device=self.device))
         self.log_entropy_alpha.requires_grad_(True)
         
@@ -75,7 +79,7 @@ class Agent(AgentBase):
                 'lr': 0,
                 'average_q': 0
                 }
-        # logs
+
         epochs = 0
 
         for train_epoch in range(self.train_epochs):
@@ -83,21 +87,26 @@ class Agent(AgentBase):
 
             # get batches
             states_tensor, actions_tensor, rewards_tensor, \
-                next_states_tensor, _, fails_tensor = self.replay_buffer.getBatches(self.batch_size, self.obs_rms, self.reward_rms)
+                next_states_tensor, _, fails_tensor = self.replay_buffer.getBatches(
+                    self.batch_size, self.obs_rms, self.reward_rms
+                )
             
-            # ============================ implement here ============================ #
+            # alpha 값
             with torch.no_grad():
                 entropy_alpha = self.log_entropy_alpha.exp()
 
-            # critic update
+            # -------------------- critic update -------------------- #
             with torch.no_grad():
-                ##############
-                ##  eq.1~2  ##
-                ##############
-                next_actions_tensor, next_log_probs_tensor = self.actor(next_states_tensor)
+                # actor는 SquashedNormal 분포를 반환
+                next_action_dists = self.actor(next_states_tensor)
+                next_actions_tensor = next_action_dists.rsample()
+                next_log_probs_tensor = next_action_dists.log_prob(next_actions_tensor).sum(dim=-1, keepdim=True)
+
                 target_critic1, target_critic2 = self.target_critic(next_states_tensor, next_actions_tensor)
                 target_min_q = torch.min(target_critic1, target_critic2)
-                target_q = rewards_tensor + self.discount_factor * (1 - fails_tensor) * (target_min_q - entropy_alpha * next_log_probs_tensor)
+                target_q = rewards_tensor + self.discount_factor * (1 - fails_tensor) * (
+                    target_min_q - entropy_alpha * next_log_probs_tensor
+                )
 
             self.critic_optim.zero_grad()
             critic1, critic2 = self.critic(states_tensor, actions_tensor)
@@ -109,12 +118,11 @@ class Agent(AgentBase):
             # target critic update
             softTargetUpdate(self.critic, self.target_critic, self.polyak_tau)
 
-            # alpha update
-            ##############
-            ##   eq.4   ##
-            ##############
+            # -------------------- alpha update -------------------- #
             with torch.no_grad():
-                _, log_probs_tensor = self.actor(states_tensor)
+                action_dists = self.actor(states_tensor)
+                sampled_actions = action_dists.rsample()
+                log_probs_tensor = action_dists.log_prob(sampled_actions).sum(dim=-1, keepdim=True)
                 entropy = -log_probs_tensor.mean()
                     
             self.alpha_optim.zero_grad()
@@ -122,13 +130,12 @@ class Agent(AgentBase):
             entropy_loss.backward()
             self.alpha_optim.step()
                 
-            # actor update
-            ##############
-            ##  eq.5~6  ##
-            ##############
+            # -------------------- actor update -------------------- #
             self.critic.eval()
-            # Re-sample actions to get gradients properly
-            actions_tensor_new, log_probs_tensor_new = self.actor(states_tensor)
+            action_dists_new = self.actor(states_tensor)
+            actions_tensor_new = action_dists_new.rsample()
+            log_probs_tensor_new = action_dists_new.log_prob(actions_tensor_new).sum(dim=-1, keepdim=True)
+
             critic1_new, critic2_new = self.critic(states_tensor, actions_tensor_new)
             min_q_new = torch.min(critic1_new, critic2_new)
             
@@ -141,8 +148,7 @@ class Agent(AgentBase):
             self.critic.train()
             
             q = min_q_new
-            # ======================================================================== #
-    
+        
         train_results = {
             'critic_loss':critic_loss.item(),
             'actor_loss':actor_loss.item(),

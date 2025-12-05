@@ -82,28 +82,41 @@ class Actor(nn.Module):
         # ======= implement here ======= #
         self.fc1 = nn.Linear(self.obs_dim, self.hidden1_units)
         self.fc2 = nn.Linear(self.hidden1_units, self.hidden2_units)
-
         self.fc_mean = nn.Linear(self.hidden2_units, self.action_dim)
+
+        # LayerNorm 추가 (선택적으로 안정성 향상)
+        self.ln1 = nn.LayerNorm(self.hidden1_units)
+        self.ln2 = nn.LayerNorm(self.hidden2_units)
         # ============================== #
+
         self.activ = eval(f'torch.nn.{self.activation}()')
         self.output_activ = torch.tanh
+
         self.log_std = torch.tensor(
-            [self.log_std_init]*self.action_dim, dtype=torch.float32, 
-            requires_grad=args.log_std_grad, device=args.device
+            [self.log_std_init]*self.action_dim,
+            dtype=torch.float32,
+            requires_grad=args.log_std_grad,
+            device=args.device
         )
         self.log_std = nn.Parameter(self.log_std)
         self.register_parameter(name="my_log_std", param=self.log_std)
 
     def forward(self, x):
         # ======= implement here ======= #
-        x = self.activ(self.fc1(x))
-        x = self.activ(self.fc2(x))
+        x = self.fc1(x)
+        x = self.activ(x)
+        x = self.ln1(x)
+
+        x = self.fc2(x)
+        x = self.activ(x)
+        x = self.ln2(x)
         # ============================== #
+
         mean = self.output_activ(self.fc_mean(x))
 
         log_std = torch.clamp(self.log_std, min=LOG_STD_MIN, max=LOG_STD_MAX)
-        std = torch.ones_like(mean)*torch.exp(log_std)
-        
+        std = torch.ones_like(mean) * torch.exp(log_std)
+
         action_dists = torch.distributions.Normal(mean, std)
         return action_dists
 
@@ -124,22 +137,35 @@ class SquashedActor(nn.Module):
         # ======= implement here ======= #
         self.fc1 = nn.Linear(self.obs_dim, self.hidden1_units)
         self.fc2 = nn.Linear(self.hidden1_units, self.hidden2_units)
-        
+
         self.mean_layer = nn.Linear(self.hidden2_units, self.action_dim)
         self.log_std_layer = nn.Linear(self.hidden2_units, self.action_dim)
+
+        # LayerNorm 추가
+        self.ln1 = nn.LayerNorm(self.hidden1_units)
+        self.ln2 = nn.LayerNorm(self.hidden2_units)
         # ============================== #
+
         self.activ = eval(f'torch.nn.{self.activation}()')
         
     def forward(self, x):
         # ======= implement here ======= #
-        x = self.activ(self.fc1(x))
-        x = self.activ(self.fc2(x))
+        x = self.fc1(x)
+        x = self.activ(x)
+        x = self.ln1(x)
+
+        x = self.fc2(x)
+        x = self.activ(x)
+        x = self.ln2(x)
         # ============================== #
+
         mean = self.mean_layer(x)
-        
+
+        # 🔧 정석 SAC 스타일: LOG_STD_MIN ~ LOG_STD_MAX 로만 클리핑
         log_std = self.log_std_layer(x)
-        std = torch.exp(torch.clamp(log_std, min=LOG_STD_MIN*2.5, max=LOG_STD_MAX))
-        
+        log_std = torch.clamp(log_std, min=LOG_STD_MIN, max=LOG_STD_MAX)
+        std = torch.exp(log_std)
+
         action_dists = SquashedNormal(mean, std)
         return action_dists
 
@@ -163,13 +189,24 @@ class Critic(nn.Module):
         self.fc1 = nn.Linear(self.obs_dim, self.hidden1_units)
         self.fc2 = nn.Linear(self.hidden1_units, self.hidden2_units)
         self.fc3 = nn.Linear(self.hidden2_units, 1)
+
+        # LayerNorm 추가 (critic도 안정성에 도움)
+        self.ln1 = nn.LayerNorm(self.hidden1_units)
+        self.ln2 = nn.LayerNorm(self.hidden2_units)
         # ============================== #
+
         self.activ = eval(f'torch.nn.{self.activation}()')
 
     def forward(self, x):
         # ======= implement here ======= #
-        x = self.activ(self.fc1(x))
-        x = self.activ(self.fc2(x))
+        x = self.fc1(x)
+        x = self.activ(x)
+        x = self.ln1(x)
+
+        x = self.fc2(x)
+        x = self.activ(x)
+        x = self.ln2(x)
+
         x = self.fc3(x)
         # ============================== #
         assert x.dim() == 2
@@ -192,14 +229,25 @@ class QCritic(nn.Module):
         self.fc1 = nn.Linear(self.obs_dim + self.action_dim, self.hidden1_units)
         self.fc2 = nn.Linear(self.hidden1_units, self.hidden2_units)
         self.fc3 = nn.Linear(self.hidden2_units, 1)
+
+        self.ln1 = nn.LayerNorm(self.hidden1_units)
+        self.ln2 = nn.LayerNorm(self.hidden2_units)
         # ============================== #
+
         self.activ = eval(f'torch.nn.{self.activation}()')
 
     def forward(self, state, action):
         # ======= implement here ======= #
         x = torch.cat([state, action], dim=-1)
-        x = self.activ(self.fc1(x))
-        x = self.activ(self.fc2(x))
+
+        x = self.fc1(x)
+        x = self.activ(x)
+        x = self.ln1(x)
+
+        x = self.fc2(x)
+        x = self.activ(x)
+        x = self.ln2(x)
+
         x = self.fc3(x)
         # ============================== #
         assert x.dim() == 2

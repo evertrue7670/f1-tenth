@@ -1,70 +1,47 @@
-'''
-    This F1Wrapper is for 
-        1. usage issue (gymnasium style)
-        2. define observation & action space
-        3. observation processing (concatenate lidar + other properties)
-        
-        ->  outputs of step function should have (n_agents, dim) shape
-            ex) observations, rewards, terminates, truncates, infos = env.step([agent_1_action, 
-                                                                                agent_2_action,
-                                                                                ,,,
-                                                                                agent_n_action])
-'''
-
 from collections import deque
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-import warnings
+EPS = 1e-8
 
 def unnormalize_speed(value, minimum, maximum):
     """
-    Unnormalize speed from [-1, 1] or [0, 1] range to [minimum, maximum] range.
-    CRITICAL: Speed must be non-negative, so negative inputs are treated as 0.
-    
-    Args:
-        value: normalized speed in [-1, 1] or [0, 1] range
-        minimum: minimum speed (should be >= 0)
-        maximum: maximum speed
-    
-    Returns:
-        unnormalized speed in [minimum, maximum] range (always >= 0)
+    Unnormalize speed from [0, 1] (또는 [-1, 1]에서 잘린 값) range to [minimum, maximum] range.
+    Speed는 항상 >= 0 으로 보장.
     """
     value = np.asarray(value)
-    
-    # CRITICAL: Negative speed causes math domain errors!
-    # Treat negative values as 0 (brake)
+
+    # 음수는 브레이크로 간주
     value = np.maximum(value, 0.0)
-    
-    # If value is in [-1, 1] range (but now >= 0), map to [0, 1]
-    # If value is already in [0, 1], keep as is
-    if np.any(value > 1.0):
-        # Already beyond 1, clip to [0, 1]
-        value = np.clip(value, 0.0, 1.0)
-    
-    # Linear transformation: [0, 1] -> [min, max]
-    temp_a = (maximum - minimum)
-    temp_b = minimum
-    
-    # numpy broadcasting safety
+
+    # [-1,1] 이었더라도 step에서 이미 [0,1]로 클리핑한 상태가 들어옴.
+    # 혹시 모를 overflow 방지.
+    value = np.clip(value, 0.0, 1.0)
+
+    # [0,1] -> [min, max]
+    temp_a = (maximum - minimum) / 2.0
+    temp_b = (maximum + minimum) / 2.0
+
     temp_a = np.ones_like(value) * temp_a
     temp_b = np.ones_like(value) * temp_b
-    result = temp_a * value + temp_b
-    
-    # Final safety: ensure non-negative and within bounds
-    min_speed = max(0.0, minimum)  # Speed cannot be negative
+    result = temp_a * value * 2.0 + temp_b
+
+    # 최종 안전장치
+    min_speed = max(0.0, minimum)
     result = np.clip(result, min_speed, maximum)
-    
     return result
+
 
 class F1Wrapper(gym.Wrapper):
     def __init__(self, args, maps, render_mode=None) -> None:
-        
-        self._env = gym.make("f1tenth_gym:f1tenth-v0", 
-                            args=args,
-                            maps=maps,
-                            render_mode=render_mode)
+
+        self._env = gym.make(
+            "f1tenth_gym:f1tenth-v0",
+            args=args,
+            maps=maps,
+            render_mode=render_mode
+        )
         super().__init__(self._env)
         self.show_centerline = args.show_centerline
 
@@ -76,290 +53,291 @@ class F1Wrapper(gym.Wrapper):
         # for spaces
         self.obs_dim = args.obs_dim
         self.action_dim = args.action_dim
-        self.observation_space = spaces.Box(-np.inf*np.ones(self.obs_dim), np.inf*np.ones(self.obs_dim), dtype=np.float32)
-        self.action_space = spaces.Box(-np.ones(self.action_dim), np.ones(self.action_dim), dtype=np.float32)
-        
-        # Initialize internal states
+        self.observation_space = spaces.Box(
+            -np.inf * np.ones(self.obs_dim),
+            np.inf * np.ones(self.obs_dim),
+            dtype=np.float32
+        )
+        self.action_space = spaces.Box(
+            -np.ones(self.action_dim),
+            np.ones(self.action_dim),
+            dtype=np.float32
+        )
+
+        # pose 관련 상태
         self.position_frenet = np.zeros(2)
         self.yaw_frenet = 0.0
         self.delta_s = 0.0
         self.collision = False
-        self.prev_steer = 0.0  # For steering smoothness reward
-        self.scan_buffer = np.zeros(1080) # Buffer for lidar processing
 
+        # steering smoothness 용
+        self.prev_steer = 0.0
+
+    # ------------------------ Pose 업데이트 ------------------------ #
     def _reset_pose(self, obs_dict):
         # collision
         self.collision = obs_dict['collisions'][0]
-        
-        # cartesian coordinate pose
-        poses_x, poses_y, poses_theta = obs_dict['poses_x'][0], obs_dict['poses_y'][0], obs_dict['poses_theta'][0]
-        
-        # Check for NaN/Inf in poses and clip to reasonable ranges
-        poses_x = np.nan_to_num(poses_x, nan=0.0, posinf=1000.0, neginf=-1000.0)
-        poses_y = np.nan_to_num(poses_y, nan=0.0, posinf=1000.0, neginf=-1000.0)
-        poses_theta = np.nan_to_num(poses_theta, nan=0.0, posinf=np.pi, neginf=-np.pi)
+
+        # cartesian pose
+        poses_x = np.nan_to_num(obs_dict['poses_x'][0], nan=0.0, posinf=1000.0, neginf=-1000.0)
+        poses_y = np.nan_to_num(obs_dict['poses_y'][0], nan=0.0, posinf=1000.0, neginf=-1000.0)
+        poses_theta = np.nan_to_num(obs_dict['poses_theta'][0], nan=0.0, posinf=np.pi, neginf=-np.pi)
         poses_theta = np.clip(poses_theta, -2*np.pi, 2*np.pi)
-        
+
         self.position = np.stack([poses_x, poses_y]).T
         self.yaw = poses_theta
-        
-        # frenet coordinate pose with comprehensive error handling
+
+        # frenet pose
         try:
             s, ey, phi = self._env.track.cartesian_to_frenet2(poses_x, poses_y, poses_theta)
-            # Check for NaN/Inf in frenet coordinates
             if np.isnan(s) or np.isnan(ey) or np.isnan(phi) or \
                np.isinf(s) or np.isinf(ey) or np.isinf(phi):
                 s, ey, phi = 0.0, 0.0, 0.0
             else:
-                # Clip to reasonable ranges
                 s = float(np.clip(s, -1000.0, 10000.0))
                 ey = float(np.clip(ey, -50.0, 50.0))
                 phi = float(np.clip(phi, -2*np.pi, 2*np.pi))
         except Exception:
             s, ey, phi = 0.0, 0.0, 0.0
-        
+
         self.position_frenet = np.array([s, ey], dtype=np.float32)
         self.yaw_frenet = float(phi)
         self.delta_s = 0.0
 
     def _step_pose(self, obs_dict):
-        # collision
         self.collision = obs_dict['collisions'][0]
-        
-        # cartesian coordinate pose
-        poses_x, poses_y, poses_theta = obs_dict['poses_x'][0], obs_dict['poses_y'][0], obs_dict['poses_theta'][0]
-        
-        # Check for NaN/Inf in poses and clip to reasonable ranges
-        poses_x = np.nan_to_num(poses_x, nan=0.0, posinf=1000.0, neginf=-1000.0)
-        poses_y = np.nan_to_num(poses_y, nan=0.0, posinf=1000.0, neginf=-1000.0)
-        poses_theta = np.nan_to_num(poses_theta, nan=0.0, posinf=np.pi, neginf=-np.pi)
+
+        poses_x = np.nan_to_num(obs_dict['poses_x'][0], nan=0.0, posinf=1000.0, neginf=-1000.0)
+        poses_y = np.nan_to_num(obs_dict['poses_y'][0], nan=0.0, posinf=1000.0, neginf=-1000.0)
+        poses_theta = np.nan_to_num(obs_dict['poses_theta'][0], nan=0.0, posinf=np.pi, neginf=-np.pi)
         poses_theta = np.clip(poses_theta, -2*np.pi, 2*np.pi)
-        
+
         self.position = np.stack([poses_x, poses_y]).T
         self.yaw = poses_theta
-        
-        # Safe fallback values
+
         prev_s = float(self.position_frenet[0]) if hasattr(self, 'position_frenet') else 0.0
         prev_ey = float(self.position_frenet[1]) if hasattr(self, 'position_frenet') else 0.0
         prev_phi = float(self.yaw_frenet) if hasattr(self, 'yaw_frenet') else 0.0
-        
+
         try:
-            # Suppress warnings and try conversion
+            import warnings
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 s, ey, phi = self._env.track.cartesian_to_frenet2(poses_x, poses_y, poses_theta)
-            
+
             if np.isnan(s) or np.isnan(ey) or np.isnan(phi) or \
                np.isinf(s) or np.isinf(ey) or np.isinf(phi):
                 raise ValueError("Invalid Frenet Coordinates")
-            
+
             s = float(np.clip(s, -1000.0, 10000.0))
             ey = float(np.clip(ey, -50.0, 50.0))
             phi = float(np.clip(phi, -2*np.pi, 2*np.pi))
-            
+
         except Exception:
-            # On ANY failure, assume small forward movement or stay put
-            s, ey, phi = prev_s + 0.1, prev_ey, prev_phi # Assume slight forward progress to avoid stuck logic
-        
-        # Delta S logic
+            # 실패하면 살짝 앞으로 간다고 가정 (stuck 방지용)
+            s, ey, phi = prev_s + 0.1, prev_ey, prev_phi
+
+        # delta s 계산
         self.delta_s = s - prev_s
-        
+
+        # 랩 크로싱 보정
         try:
-            # Lap crossing logic
             total_track_s = self._env.track.centerline.spline.s[-1]
-            if abs(self.delta_s) > total_track_s/2.0:
+            if abs(self.delta_s) > total_track_s / 2.0:
                 if self.delta_s < 0:
                     self.delta_s += total_track_s
                 else:
                     self.delta_s -= total_track_s
         except:
             pass
-        
+
         self.delta_s = float(np.nan_to_num(self.delta_s, nan=0.0))
         self.delta_s = float(np.clip(self.delta_s, -100.0, 100.0))
-                        
+
         self.position_frenet = np.array([s, ey], dtype=np.float32)
         self.yaw_frenet = float(phi)
 
+    # ------------------------ Curvature 계산 ------------------------ #
+    def _get_curvature(self, s):
+        """
+        주어진 Frenet s 에서 중심선 곡률 κ(s)를 추정.
+        트랙 구현에 따라 centerline에 get_curvature 등이 없을 수도 있으므로
+        최대한 안전하게 처리 후 실패하면 0 반환.
+        """
+        try:
+            cl = self._env.track.centerline
+
+            # 1) get_curvature(s) 메서드가 있는 경우
+            if hasattr(cl, "get_curvature"):
+                kappa = cl.get_curvature(s)
+
+            # 2) curvature array + s array 형태인 경우
+            elif hasattr(cl, "curvatures") and hasattr(cl, "ss"):
+                ss = np.asarray(cl.ss)
+                curvs = np.asarray(cl.curvatures)
+                idx = np.argmin(np.abs(ss - s))
+                kappa = curvs[idx]
+            else:
+                kappa = 0.0
+
+            kappa = float(np.clip(np.nan_to_num(kappa), -5.0, 5.0))
+        except Exception:
+            kappa = 0.0
+
+        return kappa
+
+    # ------------------------ reset ------------------------ #
     def reset(self, **kwargs):
         self.history = deque(maxlen=10)
+        self.prev_steer = 0.0
+
         try:
             obs_dict, info = self._env.reset(**kwargs)
         except ValueError:
-            # If reset fails internally (rare but possible), try recursive reset or return zeros
             print("Warning: Env reset failed with ValueError. Retrying...")
             return self.observation_space.sample(), {}
 
         if self.show_centerline and self._env.unwrapped.renderer is not None:
             try:
-                self._env.unwrapped.add_render_callback(self._env.track.centerline.render_waypoints)
+                self._env.unwrapped.add_render_callback(
+                    self._env.track.centerline.render_waypoints
+                )
             except:
                 pass
-        
+
         self._reset_pose(obs_dict)
         obs = self.getObs(obs_dict, reset=True)
         info['obs_dict'] = obs_dict
         return obs, info
-    
-    def calc_reward(self, action=None):        
+
+    # ------------------------ Reward ------------------------ #
+    def calc_reward(self, action):
+        """
+        연속형 reward:
+        1) progress (delta_s)  : 앞으로 많이 갈수록 좋음  [메인]
+        2) centerline tracking : ey가 0에 가까울수록 좋음
+        3) steering smoothness : |steer - prev_steer|가 작을수록 좋음
+        4) curvature-based speed envelope : 코너에서 과속하면 penalty
+        5) collision penalty
+        """
+
         try:
             delta_s = float(self.delta_s)
-            velocity = float(self._env.sim.agents[0].state[3])
+            ey = float(self.position_frenet[1])
+            heading_error = float(self.yaw_frenet)  # 현재는 reward에는 직접 사용 X
+            velocity = float(self._env.sim.agents[0].state[3])  # vx
             collision = bool(self.collision)
-            
-            # Get lidar scan for wall proximity reward
-            scan = self._env.sim.agents[0].scan
-            min_dist = np.min(scan) if len(scan) > 0 else 0.0
         except:
-            delta_s, velocity, collision, min_dist = 0.0, 0.0, False, 0.0
-        
-        # 1. Progress Reward: Encourage speed, but not recklessly
-        velocity = np.clip(velocity, -10.0, 20.0)
-        progress_reward = velocity * 0.1
-        
-        # 2. Wall Proximity Penalty (Replaces Centerline Reward)
-        # Penalize if too close to walls (< 0.5m)
-        proximity_penalty = 0.0
-        if min_dist < 0.5:
-            proximity_penalty = 2.0 * (0.5 - min_dist)**2
-            
-        # Lidar Centering Reward (Simulates Centerline)
-        # Encourages maximizing the minimum distance to walls (staying in open space)
-        clearance_reward = min_dist * 0.1
-        
-        # 3. Steering Smoothness & Speed Logic
-        smoothness_penalty = 0.0
-        straight_bonus = 0.0
-        cornering_penalty = 0.0
-        
-        if action is not None:
-            curr_steer = float(action[0]) # Normalized steer [-1, 1]
-            abs_steer = abs(curr_steer)
-            
-            # Steering Smoothness (Anti-Wiggle)
-            steer_diff = abs(curr_steer - self.prev_steer)
-            smoothness_factor = 1.0 + max(0.0, velocity) * 0.5
-            smoothness_penalty = (steer_diff ** 2) * smoothness_factor * 0.2
-            
-            # [Logic 1] Straight Line Bonus: If steer is small, reward high speed
-            # Lowered threshold to 2.0 to make bonus more accessible
-            # Increased multiplier to 0.2 to make it more attractive
-            if abs_steer < 0.1 and velocity > 2.0:
-                straight_bonus = velocity * 0.2
-                
-            # [Logic 2] Cornering Strategy: 
-            # Case A: Fast in corner -> Penalty (Dangerous!)
-            # Case B: Slow in corner -> Reward (Safe & Pro!)
-            
-            if abs_steer > 2.5:  # Entering corner or in corner
-                if velocity > 1.5:
-                    # Penalty grows squarely with speed above 2.0
-                    cornering_penalty = ((velocity - 2.0)**2) * abs_steer * 1.0
-                elif velocity <= 1.2:
-                    # Reward for slowing down SIGNIFICANTLY in corner (Control)
-                    # Helps to break the "always full throttle" habit
-                    straight_bonus += 0.5  # Reuse variable for positive reinforcement
-            
-        # 4. Penalties
-        collision_cost = 100.0 if collision else 0.0
-        
-        # Reverse Penalty
-        reverse_penalty = 0.0
-        if velocity < -0.1:
-            reverse_penalty = 20.0 * abs(velocity)
-            progress_reward = 0.0
-            
+            delta_s, ey, heading_error, velocity, collision = 0.0, 0.0, 0.0, 0.0, False
+
+        # 0) delta_s: 너무 큰 음수는 잘라 줌 (후진 방지용)
+        delta_s_clipped = max(delta_s, -0.5)
+
+        # 1) Progress Reward (가중치 크게)
+        w_progress = 20.0          # ★ 중요: 메인 드라이버
+        R_progress = w_progress * delta_s_clipped
+
+        # 2) Centerline (Gaussian on ey)
+        ey = np.clip(ey, -5.0, 5.0)
+        ey_scale = 0.7
+        w_center = 0.3             # 예전 0.5 → 살짝 줄임
+        R_center = w_center * np.exp(-0.5 * (ey / ey_scale) ** 2)
+
+        # 3) Steering smoothness
+        steer = float(action[0])
+        steer = np.clip(steer, -1.0, 1.0)
+        w_smooth = 0.05            # 예전 0.1 → 절반
+        R_smooth = -w_smooth * abs(steer - self.prev_steer)
+        self.prev_steer = steer
+
+        # 4) Curvature-based speed envelope
+        curvature = abs(self._get_curvature(self.position_frenet[0]))
+        v_max_straight = self.max_speed
+        curvature_gain = 8.0
+        v_ref = v_max_straight / (1.0 + curvature_gain * curvature)
+        v_ref = float(np.clip(v_ref, self.min_speed, self.max_speed))
+
+        velocity = float(np.clip(np.nan_to_num(velocity), -5.0, 20.0))
+        speed_excess = max(0.0, velocity - v_ref)
+        w_speed_env = 0.1          # 예전 0.2 → 절반
+        R_speed_env = -w_speed_env * (speed_excess ** 2)
+
+        # 5) Collision penalty
+        w_collision = 500.0
+        R_collision = -w_collision if collision else 0.0
+
+        # 작은 시간 패널티 (optional)
         time_penalty = 0.01
-        
-        # Combined Reward
-        reward = (progress_reward * 1.0 +           # Go fast (Base)
-                  straight_bonus * 1.0 -            # Go fast on straights!
-                  cornering_penalty * 1.0 +         # Slow down on corners!
-                  clearance_reward * 0.5 -          # Stay away from walls
-                  proximity_penalty * 5.0 -         # Don't get too close!
-                  smoothness_penalty * 1.0 -        # Don't wiggle
-                  collision_cost -                  # Don't crash
-                  reverse_penalty -                 # Don't reverse
-                  time_penalty)                     # Hurry up
-        
+
+        reward = (
+            R_progress +
+            R_center +
+            R_smooth +
+            R_speed_env +
+            R_collision -
+            time_penalty
+        )
+
         if np.isnan(reward) or np.isinf(reward):
-            reward = -collision_cost
-            
+            reward = R_collision  # 최소한 충돌 패널티만 남기기
+
         reward_dict = {
-            'progress_reward': float(progress_reward),
-            'straight_bonus': float(straight_bonus),
-            'cornering_penalty': float(cornering_penalty),
-            'clearance_reward': float(clearance_reward),
-            'proximity_penalty': float(proximity_penalty),
-            'smoothness_penalty': float(smoothness_penalty),
-            'collision_cost': float(collision_cost),
-            'reverse_penalty': float(reverse_penalty)
+            "R_progress": float(R_progress),
+            "R_center": float(R_center),
+            "R_smooth": float(R_smooth),
+            "R_speed_env": float(R_speed_env),
+            "R_collision": float(R_collision),
+            "delta_s": float(delta_s),
+            "velocity": float(velocity),
+            "v_ref": float(v_ref),
+            "curvature": float(curvature),
         }
         return float(reward), reward_dict
-        
-    def step(self, action:np.array):
-        # ---------------------------------------------------------------------
-        # [CRITICAL FIX] 1. Sanitize Action Input
-        # Neural Network output might be NaN or Inf, which crashes the Simulator
-        # ---------------------------------------------------------------------
+
+    # ------------------------ step ------------------------ #
+    def step(self, action: np.array):
+        # 1) Action sanitization
         if np.any(np.isnan(action)) or np.any(np.isinf(action)):
-            # Fallback action: Steer 0, Speed 0 (brake)
             action = np.zeros_like(action)
-        
-        # Clip raw action to spaces.ActionSpace range (-1 to 1) just in case
+
         action = np.clip(action, -1.0, 1.0)
-        
         _action = action.copy()
-        
-        # Steer: [-1, 1] -> [-max_steer, max_steer]
-        _action[0] = np.clip(_action[0] * self.max_steer, -self.max_steer, self.max_steer)
-        
-        # Speed: Normalize from [-1, 1] or [0, 1] to [min_speed, max_speed]
-        # CRITICAL: Speed must be non-negative!
+
+        # Steer: [-1,1] -> [-max_steer, max_steer]
+        _action[0] = np.clip(_action[0] * self.max_steer,
+                             -self.max_steer, self.max_steer)
+
+        # Speed: [-1,1] -> [min_speed, max_speed] (음수는 브레이크)
         normalized_speed = _action[1]
-        
-        # If speed is negative, treat it as 0 (brake)
         if normalized_speed < 0:
             normalized_speed = 0.0
-        else:
-            # Map [0, 1] to [0, 1] (no change needed, just clip)
-            normalized_speed = np.clip(normalized_speed, 0.0, 1.0)
-        
-        _action[1] = unnormalize_speed(normalized_speed, self.min_speed, self.max_speed)
-        
-        # Final safety check: speed must be non-negative
-        _action[1] = max(0.0, float(_action[1]))
 
-        # ---------------------------------------------------------------------
-        # [CRITICAL FIX] 2. Wrap Environment Step in Try-Except
-        # Catch 'ValueError: math domain error' from inside f1tenth_gym
-        # ---------------------------------------------------------------------
+        _action[1] = unnormalize_speed(
+            normalized_speed,
+            self.min_speed,
+            self.max_speed
+        )
+        _action[1] = max(0.0, _action[1])
+
+        # 2) Env step with safety
         try:
             obs_dict, _, terminate, truncate, info = self._env.step(_action)
+
             self._step_pose(obs_dict)
             obs = self.getObs(obs_dict)
-            
-            # Pass raw action (normalized) for smoothness calculation
-            reward, reward_dict = self.calc_reward(action=action)
-            
-            # Update previous steer
-            self.prev_steer = float(action[0])
-            
+
+            reward, reward_dict = self.calc_reward(_action)
             info['obs_dict'] = obs_dict
             info.update(reward_dict)
             return obs, reward, terminate, truncate, info
 
         except ValueError as e:
-            # Log the error but DO NOT crash the training thread
             error_msg = str(e)
             if "math domain error" in error_msg:
-                # This is expected occasionally when vehicle goes off-track
-                pass  # Silent handling - this is expected behavior
+                pass
             else:
                 print(f"Warning: Caught ValueError in env.step(): {error_msg}. Action: {action}")
-            
-            # Force episode termination with a penalty
-            # Return dummy observation
+
             dummy_obs = np.zeros(self.obs_dim, dtype=np.float32)
             penalty_reward = -100.0
             return dummy_obs, penalty_reward, True, True, {"error": error_msg, "action": action.tolist()}
@@ -369,35 +347,36 @@ class F1Wrapper(gym.Wrapper):
             dummy_obs = np.zeros(self.obs_dim, dtype=np.float32)
             return dummy_obs, -100.0, True, True, {"error": str(e)}
 
+    # ------------------------ Observation ------------------------ #
     def getObs(self, obs_dict, reset=False):
         scans = np.array(obs_dict['scans'])
         if scans.ndim == 2:
             scan = scans[0]
         else:
             scan = scans.flatten()
-        
+
         scan = np.nan_to_num(scan, nan=10.0, posinf=10.0, neginf=0.0)
         scan = np.clip(scan, 0.0, 10.0)
         scan = scan.reshape(-1, 4).mean(axis=1)
-        
+
         linear_vels_x = np.array(obs_dict['linear_vels_x'])
         linear_vels_y = np.array(obs_dict['linear_vels_y'])
         ang_vels_z = np.array(obs_dict['ang_vels_z'])
-        
+
         linear_vel_x = float(linear_vels_x[0]) if linear_vels_x.ndim > 0 else float(linear_vels_x)
         linear_vel_y = float(linear_vels_y[0]) if linear_vels_y.ndim > 0 else float(linear_vels_y)
         ang_vel_z = float(ang_vels_z[0]) if ang_vels_z.ndim > 0 else float(ang_vels_z)
-        
+
         linear_vel_x = np.clip(np.nan_to_num(linear_vel_x), -20.0, 20.0)
         linear_vel_y = np.clip(np.nan_to_num(linear_vel_y), -20.0, 20.0)
         ang_vel_z = np.clip(np.nan_to_num(ang_vel_z), -10.0, 10.0)
-        
+
         lat_dev = float(self.position_frenet[1])
         head_err = float(self.yaw_frenet)
-        
+
         lat_dev = np.clip(np.nan_to_num(lat_dev), -10.0, 10.0)
         head_err = np.clip(np.nan_to_num(head_err), -2*np.pi, 2*np.pi)
-        
+
         observation = np.concatenate([
             scan,
             [linear_vel_x],
@@ -406,8 +385,11 @@ class F1Wrapper(gym.Wrapper):
             [lat_dev],
             [head_err]
         ]).astype(np.float32)
-        
+
         return observation
 
     def render(self):
         return self._env.render()
+
+    def close(self):
+        self._env.close()

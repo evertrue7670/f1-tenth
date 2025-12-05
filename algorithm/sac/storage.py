@@ -51,17 +51,19 @@ class ReplayBuffer:
         self.full = self.full or self.idx == 0
 
     def getBatches(self, batch_size, state_rms, reward_rms):
-        idxs = np.random.randint(0,
-                                self.buffer_size if self.full else self.idx,
-                                size=batch_size)
+        idxs = np.random.randint(
+            0,
+            self.buffer_size if self.full else self.idx,
+            size=batch_size
+        )
 
         states = state_rms.normalize(self.states[idxs])
         next_states = state_rms.normalize(self.next_states[idxs])
         rewards = reward_rms.normalize(self.rewards[idxs])
-        
+
         states = torch.as_tensor(states, device=self.device)
         actions = torch.as_tensor(self.actions[idxs], device=self.device)
-        rewards = torch.as_tensor(self.rewards[idxs], device=self.device)
+        rewards = torch.as_tensor(rewards, device=self.device)      # ★ 여기 고침
         next_states = torch.as_tensor(next_states, device=self.device)
         dones = torch.as_tensor(self.dones[idxs], device=self.device)
         fails = torch.as_tensor(self.fails[idxs], device=self.device)

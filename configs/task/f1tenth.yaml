@@ -7,9 +7,9 @@ show_centerline: True
 
 # env configs
 timestep: 0.025
-min_speed: 0.5
+min_speed: 0.2
 max_speed: 3.0
-max_steer: 0.44 #0.44     # calibration
+max_steer: 0.4 #0.44     # calibration
 control_input: ["speed", "steering_angle"]
 observation_config: {"type": "original"}
 reset_config: {"type": "cl_random_static"}

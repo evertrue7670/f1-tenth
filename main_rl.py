@@ -24,13 +24,14 @@ from algorithm import algo_dict
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'        # for debug
 EPS = 1e-8
 
-MAPS = ['Sochi', 'Spa', 'Nuerburgring', 'Monza', 'Melbourne', 'Austin', 
-        'Silverstone', 'Sakhir', 'IMS', 'Budapest', 'Sepang', 
-        'Oschersleben', 'YasMarina', 'MoscowRaceway', 'Zandvoort', 'Catalunya', 
+MAPS = ['Sochi', 'Spa', 'Nuerburgring', 'Monza', 'Melbourne', 'Austin',
+        'Silverstone', 'Sakhir', 'IMS', 'Budapest', 'Sepang',
+        'Oschersleben', 'YasMarina', 'MoscowRaceway', 'Zandvoort', 'Catalunya',
         'BrandsHatch', 'Shanghai', 'Hockenheim', 'SaoPaulo', 'Spielberg', 'MexicoCity']
 
-EVAL_MAPS = ['Sochi', 'IMS', 'Catalunya', 'Zandvoort', 'Silverstone', 'SaoPaulo',       # easy
-             'YasMarina', 'MoscowRaceway', 'Shanghai', 'MexicoCity']        # hard
+EVAL_MAPS = ['Sochi', 'IMS', 'Catalunya', 'Zandvoort', 'Silverstone', 'SaoPaulo',
+             'YasMarina', 'MoscowRaceway', 'Shanghai', 'MexicoCity']
+
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -42,6 +43,7 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
 def getParser():
     parser = argparse.ArgumentParser(description='F1tenth.')
     # mode
@@ -52,7 +54,6 @@ def getParser():
     parser.add_argument('--algo_idx', type=int, default=1, help='algo index.')
     parser.add_argument('--model_num', type=int, default=None, help='for checkpoint num.')
     # common
-    # Modified for Sweep: Allow --wandb=True/False input
     parser.add_argument('--wandb', type=str2bool, nargs='?', const=True, default=False, help='use wandb?')
     parser.add_argument('--comment', type=str, default=None, help='wandb comment saved in run name.')
     parser.add_argument('--device', type=str, default='gpu', help='gpu or cpu.')
@@ -67,14 +68,11 @@ def getParser():
     # for eval
     parser.add_argument('--eval_num', type=int, default=5, help='# of evaluation epochs.')
     parser.add_argument('--eval_freq', type=int, default=int(5e4), help='# of time steps for eval.')
-    # Modified for Sweep: Allow --save_video=True/False input
     parser.add_argument('--save_video', type=str2bool, nargs='?', const=True, default=False, help='save video.')
     parser.add_argument('--live_video', action='store_true', help='live video.')
-    
-    # sweep parameters (Must be defined here to be accepted by argparse)
+    # sweep parameters
     parser.add_argument('--max_steer', type=float, default=None, help='Max steering angle (sweep)')
     parser.add_argument('--max_speed', type=float, default=None, help='Max speed (sweep)')
-    
     return parser
 
 
@@ -94,14 +92,13 @@ def eval(args, env, agent, name, eval_num=1):
                 observation, reward, terminate, truncate, info = env.step(clipped_action)
             score += reward
             done = terminate or truncate
-            
-            # Collect frames for video
+
             if args.live_video or args.save_video or args.wandb:
                 frame = env.render()
                 if frame is not None:
                     _frames.append(frame)
 
-        if truncate or info['checkpoint_done']:
+        if truncate or info.get('checkpoint_done', False):
             print('[Success]   \t{:^15}\t{:>5s}'.format(env._env.map, f'{env._env.lap_times[0]:.2f}'))
         else:
             print('[Fail]      \t{:^15}\t{:>5s}'.format(env._env.map, f'{env._env.lap_times[0]:.2f}'))
@@ -114,12 +111,12 @@ def eval(args, env, agent, name, eval_num=1):
     step_mean, score_mean = np.mean(steps), np.mean(scores)
     cprint(f'[Eval]-{name} \t steps: {step_mean:.2f} \t score: {score_mean:.2f}', color='cyan')
     best_frames = frames[max_score_idx]
-    
-    # Save video locally
+
     if args.save_video and len(best_frames) > 0:
         create_video(best_frames, output_name=f'{args.save_dir}/video/{name}')
-    
+
     return best_frames, score_mean
+
 
 def train(args):
     # backup
@@ -127,100 +124,83 @@ def train(args):
     copyfile('configs/task/dynamic.yaml', f'{args.backup_dir}/dynamic.yaml')
     copyfile(f'configs/algorithm/{args.algo}.yaml', f'{args.backup_dir}/{args.algo}.yaml')
 
-    # for random seed
+    # seeds
     np.random.seed(args.seed)
-    random.seed(args.seed)    
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # define train vectorized environment
+    # train vec env
     vec_env_id = lambda: F1Wrapper(args=args, maps=MAPS)
     vec_env = gym.vector.AsyncVectorEnv([vec_env_id for _ in range(args.n_envs)])
 
-    # define eval environment
+    # eval env
     render_mode = None
     if args.live_video:
         render_mode = "human_fast"
-    if args.save_video or args.wandb:  # Enable rendering for wandb video logging
+    if args.save_video or args.wandb:
         render_mode = "rgb_array"
     eval_env = F1Wrapper(args=args, maps=EVAL_MAPS, render_mode=render_mode)
 
-    # set args value for env
+    # action bounds
     args.action_bound_min = vec_env.single_action_space.low
     args.action_bound_max = vec_env.single_action_space.high
 
-    # define agent
-    args.train_frequency = min(args.train_frequency, args.n_steps)      # for code compatibility
+    # agent
+    args.train_frequency = min(args.train_frequency, args.n_steps)
     agent = algo_dict[args.algo](args)
     agent.load(args.model_num)
 
     # wandb
     if args.wandb:
         wandb.init(
-            project='[F1tenth] Baselines', 
-            config=vars(args),  # Convert args to dict
+            project='[F1tenth] Baselines',
+            config=vars(args),
             name=f"{args.name}/{args.comment}" if args.comment else f"{args.name}/seed_{args.algo_idx}",
             tags=[args.algo, args.name],
             reinit=True
         )
-        
-        # Update args with wandb.config (for sweeps)
-        for key, value in wandb.config.items():
-            if hasattr(args, key):
-                setattr(args, key, value)
-                print(f"[Wandb Config] Overwrote args.{key} = {value}")
-            else:
-                setattr(args, key, value)
-                print(f"[Wandb Config] Added args.{key} = {value}")
-        
-        # [CRITICAL] Update save_dir to be unique for each sweep run
-        # Use wandb run ID and Hyperparameters for folder name
-        run_id = wandb.run.id
-        
-        # Format folder name with hyperparameters
-        steer_val = float(args.max_steer) if args.max_steer is not None else 0.0
-        speed_str = ""
-        if hasattr(args, 'max_speed') and args.max_speed is not None:
-            try:
-                speed_val = float(args.max_speed)
-                speed_str = f"_speed_{speed_val:.1f}"
-            except ValueError:
-                speed_str = f"_speed_{args.max_speed}"
-            
-        folder_name = f"steer_{steer_val:.2f}{speed_str}_{run_id}"
-        args.save_dir = f"results/{args.name}/{folder_name}"
-        
-        # Re-create directories with new unique path
-        args.log_dir = f'{args.save_dir}/logs'
-        args.video_dir = f'{args.save_dir}/video'
-        args.backup_dir = f'{args.save_dir}/backup'
-        os.makedirs(args.log_dir, exist_ok=True)
-        os.makedirs(args.video_dir, exist_ok=True)
-        os.makedirs(args.backup_dir, exist_ok=True)
-        
         print(f"[Wandb] Initialized. Run: {wandb.run.name}, Save Dir: {args.save_dir}")
 
-    # for log
+    # loggers
     log_list = deepcopy(agent.log_list)
     rollout_logger = {arg: Logger(args.log_dir, arg) for arg in log_list['rollout']}
     train_logger = {arg: Logger(args.log_dir, arg) for arg in log_list['train']}
 
-    # train
+    # train loop
     total_step = 0
     train_step = 0
     log_step = 0
     save_step = 0
     eval_step = 0
     best_score = -np.inf
+
     while total_step < args.total_steps:
-        
-        # ======= collect trajectories ======= #
+        # ===== collect trajectories ===== #
         start_time = time.time()
         step = 0
         observations, info = vec_env.reset()
         reward_history = [[] for _ in range(args.n_envs)]
+
+        # custom metrics per env
+        custom_metrics = [
+            {
+                "velocity_sum": 0.0,
+                "velocity_count": 0,
+                "curvature_sum": 0.0,
+                "R_speed_env_sum": 0.0,
+                "R_smooth_sum": 0.0,
+                "R_progress_sum": 0.0,
+                "R_center_sum": 0.0,
+                "R_collision_sum": 0.0,
+                "corner_velocity_sum": 0.0,
+                "corner_count": 0,
+                "steps": 0
+            } for _ in range(args.n_envs)
+        ]
+
         while step < args.n_steps:
             step += args.n_envs
             total_step += args.n_envs
@@ -234,6 +214,7 @@ def train(args):
             temp_dones = []
             temp_observations = []
 
+            # Gymnasium AsyncVectorEnv: infos 는 dict[str -> list] 구조
             for env_idx in range(args.n_envs):
                 reward_history[env_idx].append(rewards[env_idx])
                 fail = (not truncates[env_idx]) and terminates[env_idx]
@@ -242,59 +223,130 @@ def train(args):
                 temp_fails.append(fail)
                 temp_dones.append(done)
 
+                # infos 처리
+                if isinstance(infos, dict):
+                    env_info = {k: v[env_idx] for k, v in infos.items()}
+                elif isinstance(infos, tuple):
+                    env_info = infos[env_idx]
+                else:
+                    env_info = {}
+
+                m = custom_metrics[env_idx]
+
+                if "velocity" in env_info:
+                    v = float(env_info["velocity"])
+                    m["velocity_sum"] += v
+                    m["velocity_count"] += 1
+
+                if "curvature" in env_info:
+                    curv = float(env_info["curvature"])
+                    m["curvature_sum"] += curv
+                    if curv > 0.1 and "velocity" in env_info:
+                        m["corner_velocity_sum"] += float(env_info["velocity"])
+                        m["corner_count"] += 1
+
+                if "R_speed_env" in env_info:
+                    m["R_speed_env_sum"] += float(env_info["R_speed_env"])
+
+                if "R_smooth" in env_info:
+                    m["R_smooth_sum"] += float(env_info["R_smooth"])
+
+                if "R_progress" in env_info:
+                    m["R_progress_sum"] += float(env_info["R_progress"])
+
+                if "R_center" in env_info:
+                    m["R_center_sum"] += float(env_info["R_center"])
+
+                if "R_collision" in env_info:
+                    m["R_collision_sum"] += float(env_info["R_collision"])
+
+                m["steps"] += 1
+
+                # episode done 처리
                 if done:
                     ep_len = len(reward_history[env_idx])
                     score = np.sum(reward_history[env_idx])
+
                     if 'score' in rollout_logger.keys():
                         rollout_logger['score'].write(ep_len, score)
                     if 'ep_len' in rollout_logger.keys():
                         rollout_logger['ep_len'].write(ep_len, ep_len)
-                    
-                    # Log episode-level metrics to wandb
+
+                    # metrics 평균 계산
+                    steps = max(1, m["steps"])
+                    avg_vel = m["velocity_sum"] / max(1, m["velocity_count"])
+                    avg_curv = m["curvature_sum"] / steps
+                    avg_corner_vel = m["corner_velocity_sum"] / max(1, m["corner_count"])
+                    avg_r_speed = m["R_speed_env_sum"] / steps
+                    avg_r_smooth = m["R_smooth_sum"] / steps
+                    avg_r_prog = m["R_progress_sum"] / steps
+                    avg_r_center = m["R_center_sum"] / steps
+                    avg_r_coll = m["R_collision_sum"] / steps
+
                     if args.wandb:
                         wandb.log({
                             'episode/reward': score,
                             'episode/length': ep_len,
-                            'rollout/step': total_step
+                            'rollout/step': total_step,
+                            'metrics/avg_velocity': avg_vel,
+                            'metrics/avg_curvature': avg_curv,
+                            'metrics/avg_corner_velocity': avg_corner_vel,
+                            'metrics/avg_R_speed_env': avg_r_speed,
+                            'metrics/avg_R_smooth': avg_r_smooth,
+                            'metrics/avg_R_progress': avg_r_prog,
+                            'metrics/avg_R_center': avg_r_center,
+                            'metrics/avg_R_collision': avg_r_coll,
                         }, step=total_step)
-                    
+
                     reward_history[env_idx] = []
+
+                    # metrics reset
+                    custom_metrics[env_idx] = {
+                        "velocity_sum": 0.0,
+                        "velocity_count": 0,
+                        "curvature_sum": 0.0,
+                        "R_speed_env_sum": 0.0,
+                        "R_smooth_sum": 0.0,
+                        "R_progress_sum": 0.0,
+                        "R_center_sum": 0.0,
+                        "R_collision_sum": 0.0,
+                        "corner_velocity_sum": 0.0,
+                        "corner_count": 0,
+                        "steps": 0
+                    }
 
             temp_fails = np.array(temp_fails)
             temp_dones = np.array(temp_dones)
             temp_observations = np.array(temp_observations)
             agent.step(rewards, temp_dones, temp_fails, temp_observations)
+
             if total_step - train_step >= agent.train_frequency:
                 train_results = agent.train(total_step)
                 train_step = total_step
         # ==================================== #
 
-        # logging
+        # logger update
         for key, value in train_results.items():
             if key in log_list['train']:
                 train_logger[key].write(step, value)
 
-        print_len = max(int(args.n_steps/args.max_episode_steps), args.n_envs)
+        print_len = max(int(args.n_steps / args.max_episode_steps), args.n_envs)
         log_data = {
             'rollout/step': total_step,
-            'train/fps': args.n_steps/(time.time()-start_time),
-            'train/best': 0         # if best model updated, becomes True
+            'train/fps': args.n_steps / (time.time() - start_time),
+            'train/best': 0
         }
 
         # evaluation
         if total_step - eval_step >= args.eval_freq:
             eval_step = total_step
-            eval_frames, eval_score = eval(args, eval_env, agent, name=str(eval_step//args.eval_freq))
-            
-            # Log video to wandb
+            eval_frames, eval_score = eval(args, eval_env, agent, name=str(eval_step // args.eval_freq))
+
             if args.wandb and eval_frames is not None and len(eval_frames) > 0:
-                # Save temporary file for wandb upload
-                # Note: create_video automatically appends .mp4
                 video_base_path = f'{args.video_dir}/eval_step_{total_step}'
                 create_video(eval_frames, output_name=video_base_path)
-                
                 video_path = f"{video_base_path}.mp4"
-                
+
                 if os.path.exists(video_path):
                     wandb.log({
                         "eval/video": wandb.Video(video_path, fps=50, format="mp4"),
@@ -304,20 +356,21 @@ def train(args):
                     print(f"[Wandb] Uploaded video for step {total_step}")
                 else:
                     print(f"[Warning] Video file not found: {video_path}")
-            
-            # save best model
+
             if eval_score > best_score:
                 cprint(f'[{args.name}] save best model. Score: {eval_score:.2f}', bold=True, color="green")
                 agent.save(log=False)
                 best_score = eval_score
                 log_data['train/best'] = 1
 
-        # logger
+        # logger → log_data에 합치기
         for arg, logger in rollout_logger.items():
-            if arg == 'step': continue
+            if arg == 'step':
+                continue
             log_data[f'rollout/{arg}'] = logger.get_avg(print_len)
         for arg, logger in train_logger.items():
             log_data[f'train/{arg}'] = logger.get_avg()
+
         if total_step - log_step >= args.log_freq:
             log_step = total_step
             print(log_data)
@@ -339,66 +392,59 @@ def train(args):
 
 
 def test(args):
-    # for random seed
     np.random.seed(args.seed)
-    random.seed(args.seed)    
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # define Environment
     render_mode = None
     if args.live_video:
         render_mode = "human_fast"
     if args.save_video:
         render_mode = "rgb_array"
     args.max_episode_steps = 10000
-    test_env = F1Wrapper(args=args, maps=args.map if args.map else EVAL_MAPS, render_mode=render_mode)
+    test_env = F1Wrapper(args=args, maps=args.map if hasattr(args, "map") and args.map else EVAL_MAPS, render_mode=render_mode)
 
-    # set args value for env
     args.action_bound_min = test_env.action_space.low
     args.action_bound_max = test_env.action_space.high
 
-    # define agent
     agent = algo_dict[args.algo](args)
     agent.load(args.model_num)
 
-    # test
     eval(args, test_env, agent, name='test', eval_num=args.eval_num)
 
 
 if __name__ == "__main__":
-    # base configurations
     parser = getParser()
     args = parser.parse_args()
-    if args.name == None:
+    if args.name is None:
         args.name = args.algo
     args = EasyDict(vars(args))
 
-    # load configurations & merge them
     with open('configs/task/f1tenth.yaml', 'r') as f:
         task_args = EasyDict(YAML().load(f))
     with open('configs/task/dynamic.yaml', 'r') as f:
         dynamic_args = EasyDict(YAML().load(f))
     with open(f'configs/algorithm/{args.algo}.yaml', 'r') as f:
         agent_args = EasyDict(YAML().load(f))
+
     args.update(task_args)
     args.update(dynamic_args)
     args.update(agent_args)
     args.save_dir = f"results/{args.name}/{args.algo_idx}"
 
-    # ==== processing args ==== #
-    # directory
+    # dirs
     args.log_dir = f'{args.save_dir}/logs'
     args.video_dir = f'{args.save_dir}/video'
     args.backup_dir = f'{args.save_dir}/backup'
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.video_dir, exist_ok=True)
     os.makedirs(args.backup_dir, exist_ok=True)
-    # set gpu
-    os.environ["CUDA_VISIBLE_DEVICES"]=f"{args.gpu_idx}"
-    # device
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = f"{args.gpu_idx}"
+
     if torch.cuda.is_available() and args.device == 'gpu':
         device = torch.device('cuda:0')
         cprint('[torch] cuda is used.')
