@@ -87,19 +87,21 @@ class Agent(AgentBase):
             
             # ============================ implement here ============================ #
             with torch.no_grad():
-                entropy_alpha = 
+                entropy_alpha = self.log_entropy_alpha.exp()
 
             # critic update
             with torch.no_grad():
                 ##############
                 ##  eq.1~2  ##
                 ##############
-                target_v = 
-                target_q = 
+                next_actions_tensor, next_log_probs_tensor = self.actor(next_states_tensor)
+                target_critic1, target_critic2 = self.target_critic(next_states_tensor, next_actions_tensor)
+                target_min_q = torch.min(target_critic1, target_critic2)
+                target_q = rewards_tensor + self.discount_factor * (1 - fails_tensor) * (target_min_q - entropy_alpha * next_log_probs_tensor)
 
             self.critic_optim.zero_grad()
             critic1, critic2 = self.critic(states_tensor, actions_tensor)
-            critic_loss = 
+            critic_loss = F.mse_loss(critic1, target_q) + F.mse_loss(critic2, target_q)
             critic_loss.backward()
             clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.critic_optim.step()
@@ -112,10 +114,11 @@ class Agent(AgentBase):
             ##   eq.4   ##
             ##############
             with torch.no_grad():
-                entropy = 
+                _, log_probs_tensor = self.actor(states_tensor)
+                entropy = -log_probs_tensor.mean()
                     
             self.alpha_optim.zero_grad()
-            entropy_loss = 
+            entropy_loss = -(self.log_entropy_alpha * (log_probs_tensor + self.target_entropy).detach()).mean()
             entropy_loss.backward()
             self.alpha_optim.step()
                 
@@ -124,13 +127,20 @@ class Agent(AgentBase):
             ##  eq.5~6  ##
             ##############
             self.critic.eval()
-            q = 
+            # Re-sample actions to get gradients properly
+            actions_tensor_new, log_probs_tensor_new = self.actor(states_tensor)
+            critic1_new, critic2_new = self.critic(states_tensor, actions_tensor_new)
+            min_q_new = torch.min(critic1_new, critic2_new)
+            
+            actor_loss = (entropy_alpha * log_probs_tensor_new - min_q_new).mean()
+            
             self.actor_optim.zero_grad()
-            actor_loss = 
             actor_loss.backward()
             clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             self.actor_optim.step()
             self.critic.train()
+            
+            q = min_q_new
             # ======================================================================== #
     
         train_results = {

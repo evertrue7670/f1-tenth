@@ -1,0 +1,23 @@
+program: main_rl.py
+method: grid
+metric:
+  name: rollout/score
+  goal: maximize
+parameters:
+  max_steer:
+    values: [0.44, 0.42, 0.40, 0.38]
+  algo:
+    value: ppo
+  name:
+    value: ppo_sweep
+  n_envs:
+    value: 5
+  n_steps:
+    value: 5000
+  total_steps:
+    value: 4000000
+  wandb:
+    value: true
+  save_video:
+    value: true
+

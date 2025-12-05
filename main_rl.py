@@ -25,12 +25,22 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'        # for debug
 EPS = 1e-8
 
 MAPS = ['Sochi', 'Spa', 'Nuerburgring', 'Monza', 'Melbourne', 'Austin', 
-        'Silverstone', 'Sakhir', 'IMS', 'Budapest', 'Montreal', 'Sepang', 
+        'Silverstone', 'Sakhir', 'IMS', 'Budapest', 'Sepang', 
         'Oschersleben', 'YasMarina', 'MoscowRaceway', 'Zandvoort', 'Catalunya', 
         'BrandsHatch', 'Shanghai', 'Hockenheim', 'SaoPaulo', 'Spielberg', 'MexicoCity']
 
 EVAL_MAPS = ['Sochi', 'IMS', 'Catalunya', 'Zandvoort', 'Silverstone', 'SaoPaulo',       # easy
-             'YasMarina', 'MoscowRaceway', 'Shanghai', 'MexicoCity', 'Montreal']        # hard
+             'YasMarina', 'MoscowRaceway', 'Shanghai', 'MexicoCity']        # hard
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
 
 def getParser():
     parser = argparse.ArgumentParser(description='F1tenth.')
@@ -42,7 +52,8 @@ def getParser():
     parser.add_argument('--algo_idx', type=int, default=1, help='algo index.')
     parser.add_argument('--model_num', type=int, default=None, help='for checkpoint num.')
     # common
-    parser.add_argument('--wandb',  action='store_true', help='use wandb?')
+    # Modified for Sweep: Allow --wandb=True/False input
+    parser.add_argument('--wandb', type=str2bool, nargs='?', const=True, default=False, help='use wandb?')
     parser.add_argument('--comment', type=str, default=None, help='wandb comment saved in run name.')
     parser.add_argument('--device', type=str, default='gpu', help='gpu or cpu.')
     parser.add_argument('--gpu_idx', type=int, default=0, help='GPU index.')
@@ -56,8 +67,14 @@ def getParser():
     # for eval
     parser.add_argument('--eval_num', type=int, default=5, help='# of evaluation epochs.')
     parser.add_argument('--eval_freq', type=int, default=int(5e4), help='# of time steps for eval.')
-    parser.add_argument('--save_video', action='store_true', help='save video.')
+    # Modified for Sweep: Allow --save_video=True/False input
+    parser.add_argument('--save_video', type=str2bool, nargs='?', const=True, default=False, help='save video.')
     parser.add_argument('--live_video', action='store_true', help='live video.')
+    
+    # sweep parameters (Must be defined here to be accepted by argparse)
+    parser.add_argument('--max_steer', type=float, default=None, help='Max steering angle (sweep)')
+    parser.add_argument('--max_speed', type=float, default=None, help='Max speed (sweep)')
+    
     return parser
 
 
@@ -148,7 +165,42 @@ def train(args):
             tags=[args.algo, args.name],
             reinit=True
         )
-        print(f"[Wandb] Initialized. Project: [F1tenth] Baselines, Run: {wandb.run.name}")
+        
+        # Update args with wandb.config (for sweeps)
+        for key, value in wandb.config.items():
+            if hasattr(args, key):
+                setattr(args, key, value)
+                print(f"[Wandb Config] Overwrote args.{key} = {value}")
+            else:
+                setattr(args, key, value)
+                print(f"[Wandb Config] Added args.{key} = {value}")
+        
+        # [CRITICAL] Update save_dir to be unique for each sweep run
+        # Use wandb run ID and Hyperparameters for folder name
+        run_id = wandb.run.id
+        
+        # Format folder name with hyperparameters
+        steer_val = float(args.max_steer) if args.max_steer is not None else 0.0
+        speed_str = ""
+        if hasattr(args, 'max_speed') and args.max_speed is not None:
+            try:
+                speed_val = float(args.max_speed)
+                speed_str = f"_speed_{speed_val:.1f}"
+            except ValueError:
+                speed_str = f"_speed_{args.max_speed}"
+            
+        folder_name = f"steer_{steer_val:.2f}{speed_str}_{run_id}"
+        args.save_dir = f"results/{args.name}/{folder_name}"
+        
+        # Re-create directories with new unique path
+        args.log_dir = f'{args.save_dir}/logs'
+        args.video_dir = f'{args.save_dir}/video'
+        args.backup_dir = f'{args.save_dir}/backup'
+        os.makedirs(args.log_dir, exist_ok=True)
+        os.makedirs(args.video_dir, exist_ok=True)
+        os.makedirs(args.backup_dir, exist_ok=True)
+        
+        print(f"[Wandb] Initialized. Run: {wandb.run.name}, Save Dir: {args.save_dir}")
 
     # for log
     log_list = deepcopy(agent.log_list)

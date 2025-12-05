@@ -1,9 +1,22 @@
+'''
+    This F1Wrapper is for 
+        1. usage issue (gymnasium style)
+        2. define observation & action space
+        3. observation processing (concatenate lidar + other properties)
+        
+        ->  outputs of step function should have (n_agents, dim) shape
+            ex) observations, rewards, terminates, truncates, infos = env.step([agent_1_action, 
+                                                                                agent_2_action,
+                                                                                ,,,
+                                                                                agent_n_action])
+'''
+
 from collections import deque
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-EPS = 1e-8
+import warnings
 
 def unnormalize_speed(value, minimum, maximum):
     """
@@ -20,28 +33,24 @@ def unnormalize_speed(value, minimum, maximum):
     """
     value = np.asarray(value)
     
-    # Handle negative values: treat as 0 (brake)
-    # This prevents reverse speed which can cause math domain errors
+    # CRITICAL: Negative speed causes math domain errors!
+    # Treat negative values as 0 (brake)
     value = np.maximum(value, 0.0)
     
-    # If value is in [-1, 1] range, map to [0, 1]
+    # If value is in [-1, 1] range (but now >= 0), map to [0, 1]
     # If value is already in [0, 1], keep as is
     if np.any(value > 1.0):
-        # Already in [0, 1] or beyond, clip to [0, 1]
-        value = np.clip(value, 0.0, 1.0)
-    elif np.any(value < 0):
-        # In [-1, 1] range, map to [0, 1]
-        value = (value + 1.0) / 2.0
+        # Already beyond 1, clip to [0, 1]
         value = np.clip(value, 0.0, 1.0)
     
     # Linear transformation: [0, 1] -> [min, max]
-    temp_a = (maximum - minimum) / 2.0
-    temp_b = (maximum + minimum) / 2.0
+    temp_a = (maximum - minimum)
+    temp_b = minimum
     
     # numpy broadcasting safety
     temp_a = np.ones_like(value) * temp_a
     temp_b = np.ones_like(value) * temp_b
-    result = temp_a * value * 2.0 + temp_b  # Scale from [0,1] to [min,max]
+    result = temp_a * value + temp_b
     
     # Final safety: ensure non-negative and within bounds
     min_speed = max(0.0, minimum)  # Speed cannot be negative
@@ -78,7 +87,6 @@ class F1Wrapper(gym.Wrapper):
         self.prev_steer = 0.0  # For steering smoothness reward
         self.scan_buffer = np.zeros(1080) # Buffer for lidar processing
 
-
     def _reset_pose(self, obs_dict):
         # collision
         self.collision = obs_dict['collisions'][0]
@@ -98,10 +106,12 @@ class F1Wrapper(gym.Wrapper):
         # frenet coordinate pose with comprehensive error handling
         try:
             s, ey, phi = self._env.track.cartesian_to_frenet2(poses_x, poses_y, poses_theta)
+            # Check for NaN/Inf in frenet coordinates
             if np.isnan(s) or np.isnan(ey) or np.isnan(phi) or \
                np.isinf(s) or np.isinf(ey) or np.isinf(phi):
                 s, ey, phi = 0.0, 0.0, 0.0
             else:
+                # Clip to reasonable ranges
                 s = float(np.clip(s, -1000.0, 10000.0))
                 ey = float(np.clip(ey, -50.0, 50.0))
                 phi = float(np.clip(phi, -2*np.pi, 2*np.pi))
@@ -116,8 +126,10 @@ class F1Wrapper(gym.Wrapper):
         # collision
         self.collision = obs_dict['collisions'][0]
         
+        # cartesian coordinate pose
         poses_x, poses_y, poses_theta = obs_dict['poses_x'][0], obs_dict['poses_y'][0], obs_dict['poses_theta'][0]
         
+        # Check for NaN/Inf in poses and clip to reasonable ranges
         poses_x = np.nan_to_num(poses_x, nan=0.0, posinf=1000.0, neginf=-1000.0)
         poses_y = np.nan_to_num(poses_y, nan=0.0, posinf=1000.0, neginf=-1000.0)
         poses_theta = np.nan_to_num(poses_theta, nan=0.0, posinf=np.pi, neginf=-np.pi)
@@ -133,7 +145,6 @@ class F1Wrapper(gym.Wrapper):
         
         try:
             # Suppress warnings and try conversion
-            import warnings
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 s, ey, phi = self._env.track.cartesian_to_frenet2(poses_x, poses_y, poses_theta)
@@ -190,69 +201,99 @@ class F1Wrapper(gym.Wrapper):
         info['obs_dict'] = obs_dict
         return obs, info
     
-    def calc_reward(self):        
+    def calc_reward(self, action=None):        
         try:
             delta_s = float(self.delta_s)
-            lateral_deviation = float(self.position_frenet[1])
-            heading_error = float(self.yaw_frenet)
-            velocity = float(self._env.sim.agents[0].state[3]) # Linear velocity x
+            velocity = float(self._env.sim.agents[0].state[3])
             collision = bool(self.collision)
+            
+            # Get lidar scan for wall proximity reward
+            scan = self._env.sim.agents[0].scan
+            min_dist = np.min(scan) if len(scan) > 0 else 0.0
         except:
-            delta_s, lateral_deviation, heading_error, velocity, collision = 0.0, 0.0, 0.0, 0.0, False
+            delta_s, velocity, collision, min_dist = 0.0, 0.0, False, 0.0
         
-        # 1. Progress Reward: Non-linear speed reward
-        # Encourage higher speeds, but penalty for reversing is handled separately
+        # 1. Progress Reward: Encourage speed, but not recklessly
         velocity = np.clip(velocity, -10.0, 20.0)
-        
-        # Base reward for moving forward
         progress_reward = velocity * 0.1
         
-        # 2. Centerline Tracking: Cosine-like peaked reward
-        # exp(-k * x^2) is better than exp(-k * |x|) for smooth gradients near 0
-        lateral_deviation = np.clip(lateral_deviation, -10.0, 10.0)
-        centerline_reward = np.exp(-0.5 * lateral_deviation**2)  # Gaussian-like
+        # 2. Wall Proximity Penalty (Replaces Centerline Reward)
+        # Penalize if too close to walls (< 0.5m)
+        proximity_penalty = 0.0
+        if min_dist < 0.5:
+            proximity_penalty = 2.0 * (0.5 - min_dist)**2
+            
+        # Lidar Centering Reward (Simulates Centerline)
+        # Encourages maximizing the minimum distance to walls (staying in open space)
+        clearance_reward = min_dist * 0.1
         
-        # 3. Heading Alignment: Cosine reward
-        # cos(heading_error) gives 1.0 at 0 error, -1.0 at 180 deg error
-        heading_error = np.clip(heading_error, -np.pi, np.pi)
-        heading_reward = np.cos(heading_error)
+        # 3. Steering Smoothness & Speed Logic
+        smoothness_penalty = 0.0
+        straight_bonus = 0.0
+        cornering_penalty = 0.0
         
+        if action is not None:
+            curr_steer = float(action[0]) # Normalized steer [-1, 1]
+            abs_steer = abs(curr_steer)
+            
+            # Steering Smoothness (Anti-Wiggle)
+            steer_diff = abs(curr_steer - self.prev_steer)
+            smoothness_factor = 1.0 + max(0.0, velocity) * 0.5
+            smoothness_penalty = (steer_diff ** 2) * smoothness_factor * 0.2
+            
+            # [Logic 1] Straight Line Bonus: If steer is small, reward high speed
+            # Lowered threshold to 2.0 to make bonus more accessible
+            # Increased multiplier to 0.2 to make it more attractive
+            if abs_steer < 0.1 and velocity > 2.0:
+                straight_bonus = velocity * 0.2
+                
+            # [Logic 2] Cornering Strategy: 
+            # Case A: Fast in corner -> Penalty (Dangerous!)
+            # Case B: Slow in corner -> Reward (Safe & Pro!)
+            
+            if abs_steer > 2.5:  # Entering corner or in corner
+                if velocity > 1.5:
+                    # Penalty grows squarely with speed above 2.0
+                    cornering_penalty = ((velocity - 2.0)**2) * abs_steer * 1.0
+                elif velocity <= 1.2:
+                    # Reward for slowing down SIGNIFICANTLY in corner (Control)
+                    # Helps to break the "always full throttle" habit
+                    straight_bonus += 0.5  # Reuse variable for positive reinforcement
+            
         # 4. Penalties
         collision_cost = 100.0 if collision else 0.0
         
-        # CRITICAL: Reverse Penalty
-        # If velocity is negative, apply huge penalty to discourage "cowardly" behavior
+        # Reverse Penalty
         reverse_penalty = 0.0
         if velocity < -0.1:
-            reverse_penalty = 20.0 * abs(velocity) # Strong penalty proportional to reverse speed
-            progress_reward = 0.0 # No progress reward for reversing
+            reverse_penalty = 20.0 * abs(velocity)
+            progress_reward = 0.0
             
-        # 5. Steering Smoothness (Optional but good)
-        # Penalize high steering changes if available (requires storing prev action)
-        
-        # 6. Time penalty (Constant existence cost)
         time_penalty = 0.01
         
         # Combined Reward
-        # Weighted sum favoring speed on track
-        reward = (progress_reward * 2.0 +           # Main driver
-                  centerline_reward * 0.5 +         # Keep on track
-                  heading_reward * 0.5 -            # Face forward
+        reward = (progress_reward * 1.0 +           # Go fast (Base)
+                  straight_bonus * 1.0 -            # Go fast on straights!
+                  cornering_penalty * 1.0 +         # Slow down on corners!
+                  clearance_reward * 0.5 -          # Stay away from walls
+                  proximity_penalty * 5.0 -         # Don't get too close!
+                  smoothness_penalty * 1.0 -        # Don't wiggle
                   collision_cost -                  # Don't crash
                   reverse_penalty -                 # Don't reverse
                   time_penalty)                     # Hurry up
         
-        # Safety clip
         if np.isnan(reward) or np.isinf(reward):
             reward = -collision_cost
             
         reward_dict = {
             'progress_reward': float(progress_reward),
-            'centerline_reward': float(centerline_reward),
-            'heading_reward': float(heading_reward),
+            'straight_bonus': float(straight_bonus),
+            'cornering_penalty': float(cornering_penalty),
+            'clearance_reward': float(clearance_reward),
+            'proximity_penalty': float(proximity_penalty),
+            'smoothness_penalty': float(smoothness_penalty),
             'collision_cost': float(collision_cost),
-            'reverse_penalty': float(reverse_penalty),
-            'velocity': float(velocity)
+            'reverse_penalty': float(reverse_penalty)
         }
         return float(reward), reward_dict
         
@@ -280,13 +321,14 @@ class F1Wrapper(gym.Wrapper):
         # If speed is negative, treat it as 0 (brake)
         if normalized_speed < 0:
             normalized_speed = 0.0
+        else:
+            # Map [0, 1] to [0, 1] (no change needed, just clip)
+            normalized_speed = np.clip(normalized_speed, 0.0, 1.0)
         
-        # Map [0, 1] to [min_speed, max_speed]
-        # If input was in [-1, 1], we already clamped to 0, so now map [0, 1] -> [min, max]
         _action[1] = unnormalize_speed(normalized_speed, self.min_speed, self.max_speed)
         
         # Final safety check: speed must be non-negative
-        _action[1] = max(0.0, _action[1])
+        _action[1] = max(0.0, float(_action[1]))
 
         # ---------------------------------------------------------------------
         # [CRITICAL FIX] 2. Wrap Environment Step in Try-Except
@@ -294,13 +336,15 @@ class F1Wrapper(gym.Wrapper):
         # ---------------------------------------------------------------------
         try:
             obs_dict, _, terminate, truncate, info = self._env.step(_action)
-            
-            # Update steer buffer
-            self.steer_buffer.append(action[0])
-            
             self._step_pose(obs_dict)
             obs = self.getObs(obs_dict)
-            reward, reward_dict = self.calc_reward()
+            
+            # Pass raw action (normalized) for smoothness calculation
+            reward, reward_dict = self.calc_reward(action=action)
+            
+            # Update previous steer
+            self.prev_steer = float(action[0])
+            
             info['obs_dict'] = obs_dict
             info.update(reward_dict)
             return obs, reward, terminate, truncate, info
@@ -310,8 +354,6 @@ class F1Wrapper(gym.Wrapper):
             error_msg = str(e)
             if "math domain error" in error_msg:
                 # This is expected occasionally when vehicle goes off-track
-                # The error is caught and episode is terminated safely
-                # No need to print every time (too verbose)
                 pass  # Silent handling - this is expected behavior
             else:
                 print(f"Warning: Caught ValueError in env.step(): {error_msg}. Action: {action}")
@@ -369,6 +411,3 @@ class F1Wrapper(gym.Wrapper):
 
     def render(self):
         return self._env.render()
-
-    def close(self):
-        self._env.close()

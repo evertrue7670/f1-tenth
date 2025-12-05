@@ -1,0 +1,11 @@
+program: main_rl.py
+method: grid
+metric:
+  name: rollout/score
+  goal: maximize
+parameters:
+  algo:
+    value: sac
+  max_steer:
+    values: [0.44, 0.42, 0.40, 0.38]
+
